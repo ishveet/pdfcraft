@@ -82,8 +82,15 @@ fn export_format_for_path(path: &std::path::Path) -> Result<pdfcraft_engine::Dat
 }
 
 enum ExportPathResolution {
-    Export { format: pdfcraft_engine::DataFormat, path: std::path::PathBuf },
-    Retry { error: String, path: std::path::PathBuf },
+    Export {
+        format: pdfcraft_engine::DataFormat,
+        path: std::path::PathBuf,
+    },
+    Retry {
+        error: String,
+        #[cfg(target_os = "macos")]
+        path: std::path::PathBuf,
+    },
     Reject(String),
 }
 
@@ -93,7 +100,11 @@ fn resolve_export_path(path: std::path::PathBuf, selected: Option<pdfcraft_engin
     match selected {
         Some(format) => match validate_export_extension(&path, format) {
             Ok(()) => ExportPathResolution::Export { format, path },
-            Err(error) => ExportPathResolution::Retry { error, path },
+            Err(error) => ExportPathResolution::Retry {
+                error,
+                #[cfg(target_os = "macos")]
+                path,
+            },
         },
         None => match export_format_for_path(&path) {
             Ok(format) => ExportPathResolution::Export { format, path },
@@ -1227,7 +1238,7 @@ pub(crate) fn export_data_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let modal = crate::widgets::show_modal(ctx, "export_data_format", |ui| {
         ui.heading(title);
         ui.add_space(6.0);
-        egui::ComboBox::from_id_salt("export_data_format_choice").selected_text(export_format_label(prompt.format)).show_ui(ui, |ui| {
+        craft_ui::ComboBox::from_id_salt("export_data_format_choice").selected_text(export_format_label(prompt.format)).show_ui(ui, |ui| {
             for format in export_formats(prompt.comments, prompt.xfa) {
                 ui.selectable_value(&mut prompt.format, *format, export_format_label(*format));
             }
@@ -1284,11 +1295,17 @@ mod stem_tests {
         let confirmed_path = dir.join("report.xml");
         let rewritten_path = dir.join("report.csv");
         std::fs::write(&confirmed_path, b"existing XML destination").unwrap();
+        #[cfg(target_os = "macos")]
         match resolve_export_path(confirmed_path.clone(), Some(F::Csv)) {
             ExportPathResolution::Retry { error, path } => {
                 assert!(error.contains(".csv"));
                 assert_eq!(path, confirmed_path);
             }
+            _ => panic!("a mismatched suffix must require a new confirmation"),
+        }
+        #[cfg(not(target_os = "macos"))]
+        match resolve_export_path(confirmed_path.clone(), Some(F::Csv)) {
+            ExportPathResolution::Retry { error } => assert!(error.contains(".csv")),
             _ => panic!("a mismatched suffix must require a new confirmation"),
         }
         assert_eq!(std::fs::read(&confirmed_path).unwrap(), b"existing XML destination");
@@ -1330,8 +1347,8 @@ mod stem_tests {
             format: F::Xfdf,
         });
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| super::export_data_prompt(&mut app, ctx));
-        let _ = ctx.run(
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| super::export_data_prompt(&mut app, ui.ctx()));
+        let _ = ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -1342,7 +1359,7 @@ mod stem_tests {
                 }],
                 ..Default::default()
             },
-            |ctx| super::export_data_prompt(&mut app, ctx),
+            |ui| super::export_data_prompt(&mut app, ui.ctx()),
         );
         assert!(app.export_data_prompt.is_none());
     }
