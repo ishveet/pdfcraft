@@ -805,6 +805,73 @@ fn exporting_form_data_while_typing_includes_the_text() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn save_override_exports_matching_form_data_for_each_standard_extension() {
+    let dir = scratch("export-formats");
+    let mut h = harness();
+    assert!(
+        h.state_mut().apply_edit(pdfcraft_engine::Edit::SetFieldValue {
+            name: "name".into(),
+            value: pdfcraft_engine::FieldValue::Text("Format value".into()),
+        })
+    );
+    for (extension, marker) in [("xfdf", "<xfdf"), ("fdf", "%FDF-1.2"), ("xml", "<fields"), ("csv", "name"), ("txt", "\t")] {
+        let out = dir.join(format!("data.{extension}"));
+        h.state_mut().save_override = Some(out.to_string_lossy().into_owned());
+        h.state_mut().export_data_dialog(false, true);
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.windows(marker.len()).any(|window| window == marker.as_bytes()), "{extension} export marker missing");
+        assert!(bytes.windows(b"Format value".len()).any(|window| window == b"Format value"), "{extension} export omitted the field value");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unsupported_save_override_extensions_leave_the_exact_requested_path_untouched() {
+    let dir = scratch("export-invalid-override");
+    let mut h = harness();
+    for name in ["extensionless", "data.unknown"] {
+        let path = dir.join(name);
+        std::fs::write(&path, b"keep this file").unwrap();
+        h.state_mut().save_override = Some(path.to_string_lossy().into_owned());
+        h.state_mut().export_data_dialog(false, true);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep this file", "override {name} was changed");
+        assert!(!path.with_extension("xfdf").exists(), "override {name} must not be redirected");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn picker_confirmation_uses_the_confirmed_supported_extension_without_redirecting() {
+    let dir = scratch("export-picker-confirmation");
+    let mut h = harness();
+    let out = dir.join("data.csv");
+    h.state_mut().pick_override = Some(vec![out.to_string_lossy().into_owned()]);
+    h.state_mut().export_data_dialog(false, true);
+    h.run_steps(3);
+    let bytes = std::fs::read(&out).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("name"));
+    assert!(text.contains(","), "the confirmed CSV path must contain CSV bytes");
+    assert!(!dir.join("data.xfdf").exists(), "the confirmed path must not be redirected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn canceled_picker_export_leaves_an_existing_destination_unchanged() {
+    let dir = scratch("export-picker-cancel");
+    let out = dir.join("data.csv");
+    std::fs::write(&out, b"keep this destination").unwrap();
+    let mut h = harness();
+    h.state_mut().pick_override = Some(Vec::new());
+    h.state_mut().export_data_dialog(false, true);
+    h.run_steps(3);
+    assert_eq!(std::fs::read(&out).unwrap(), b"keep this destination");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One text field, `qty`, whose validation script refuses values over 100.
 fn validated_form() -> Vec<u8> {
     pdf_from_objects(&[
