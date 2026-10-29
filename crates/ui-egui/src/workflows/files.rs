@@ -1347,8 +1347,9 @@ mod stem_tests {
             format: F::Xfdf,
         });
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| super::export_data_prompt(&mut app, ui.ctx()));
-        let _ = ctx.run_ui(
+        let mut first = ctx.run_ui(egui::RawInput::default(), |ui| super::export_data_prompt(&mut app, ui.ctx()));
+        first.textures_delta.clear();
+        let mut second = ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
                     key: egui::Key::Escape,
@@ -1361,6 +1362,7 @@ mod stem_tests {
             },
             |ui| super::export_data_prompt(&mut app, ui.ctx()),
         );
+        second.textures_delta.clear();
         assert!(app.export_data_prompt.is_none());
     }
 
