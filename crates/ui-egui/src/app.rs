@@ -74,6 +74,7 @@ impl PdfCraftApp {
             flatten_fill_sign_on_save: false,
             fill_text_size: fill_sign::TEXT_SIZE,
             dialog: None,
+            export_data_prompt: None,
             updates: updates::Updates::default(),
             printer_source: None,
             options_source: None,
@@ -283,6 +284,7 @@ impl PdfCraftApp {
     /// on the document underneath it.
     pub(crate) fn modal_open(&self) -> bool {
         self.dialog.is_some()
+            || self.export_data_prompt.is_some()
             || self.close_request.is_some()
             || self.password_prompt.is_some()
             || self.unlock_prompt.is_some()

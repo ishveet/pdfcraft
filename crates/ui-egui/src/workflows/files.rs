@@ -9,6 +9,99 @@ use pdfcraft_engine::{DocId, Edit, SplitBy};
 
 use crate::PdfCraftApp;
 
+/// Export state held while macOS asks for a format before opening its native save panel.
+#[derive(Clone)]
+pub(crate) struct ExportDataPrompt {
+    id: DocId,
+    comments: bool,
+    fields: bool,
+    xfa: bool,
+    stem: String,
+    folder: Option<String>,
+    format: pdfcraft_engine::DataFormat,
+}
+
+/// List the data formats supported for comments or for the document's form type.
+fn export_formats(comments: bool, xfa: bool) -> &'static [pdfcraft_engine::DataFormat] {
+    use pdfcraft_engine::DataFormat as F;
+    if comments {
+        &[F::Xfdf, F::Fdf]
+    } else if xfa {
+        &[F::Xml, F::Xdp, F::Xfdf, F::Fdf, F::Csv, F::Txt]
+    } else {
+        &[F::Xfdf, F::Fdf, F::Xml, F::Csv, F::Txt]
+    }
+}
+
+/// Return the canonical filename extension for a data export format.
+fn export_format_extension(format: pdfcraft_engine::DataFormat) -> &'static str {
+    use pdfcraft_engine::DataFormat as F;
+    match format {
+        F::Xfdf => "xfdf",
+        F::Fdf => "fdf",
+        F::Xml => "xml",
+        F::Xdp => "xdp",
+        F::Csv => "csv",
+        F::Txt => "txt",
+    }
+}
+
+/// Return the format name shown in the selector and native picker filters.
+fn export_format_label(format: pdfcraft_engine::DataFormat) -> &'static str {
+    use pdfcraft_engine::DataFormat as F;
+    match format {
+        F::Xfdf => "XFDF",
+        F::Fdf => "FDF",
+        F::Xml => "XML",
+        F::Xdp => "XDP",
+        F::Csv => "CSV",
+        F::Txt => "Text",
+    }
+}
+
+/// Check that a chosen destination already has the suffix required by its export format.
+fn validate_export_extension(path: &std::path::Path, format: pdfcraft_engine::DataFormat) -> Result<(), String> {
+    let actual = path.extension().and_then(std::ffi::OsStr::to_str).and_then(pdfcraft_engine::DataFormat::from_extension);
+    if actual == Some(format) {
+        Ok(())
+    } else {
+        Err(format!(
+            "This export uses {} data. Choose a filename ending in .{}; no file was written.",
+            export_format_label(format),
+            export_format_extension(format)
+        ))
+    }
+}
+
+/// Resolve the serializer from an explicit pathname, preserving that pathname exactly.
+fn export_format_for_path(path: &std::path::Path) -> Result<pdfcraft_engine::DataFormat, String> {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(pdfcraft_engine::DataFormat::from_extension)
+        .ok_or_else(|| "Choose an export filename ending in .xfdf, .fdf, .xml, .xdp, .csv or .txt; no file was written.".to_string())
+}
+
+enum ExportPathResolution {
+    Export { format: pdfcraft_engine::DataFormat, path: std::path::PathBuf },
+    Retry { error: String, path: std::path::PathBuf },
+    Reject(String),
+}
+
+/// Resolve the confirmed path without changing it; macOS retries a suffix mismatch, other native
+/// pickers infer the format from their selected filename filter.
+fn resolve_export_path(path: std::path::PathBuf, selected: Option<pdfcraft_engine::DataFormat>) -> ExportPathResolution {
+    match selected {
+        Some(format) => match validate_export_extension(&path, format) {
+            Ok(()) => ExportPathResolution::Export { format, path },
+            Err(error) => ExportPathResolution::Retry { error, path },
+        },
+        None => match export_format_for_path(&path) {
+            Ok(format) => ExportPathResolution::Export { format, path },
+            Err(error) => ExportPathResolution::Reject(error),
+        },
+    }
+}
+
 /// Why files were picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilePurpose {
@@ -1014,6 +1107,7 @@ impl PdfCraftApp {
         let _ = crate::editing::download("report.csv", csv.as_bytes());
     }
 
+    /// Export comments or form data, asking macOS users to choose its format before the save panel.
     pub fn export_data_dialog(&mut self, comments: bool, fields: bool) {
         // What's typed in a form field is part of the document (#166).
         if !self.commit_form_typing() {
@@ -1026,46 +1120,30 @@ impl PdfCraftApp {
         {
             let folder = doc.path.clone();
             let xfa = doc.info.xfa.is_some();
-            let write = move |app: &mut Self, path: std::path::PathBuf| {
-                // Include what was typed while the save panel was open (#166).
-                if !app.commit_typing_in(id) {
-                    return;
-                }
-                let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-                let format = pdfcraft_engine::DataFormat::from_extension(&ext).unwrap_or(pdfcraft_engine::DataFormat::Xfdf);
-                match app.session.export_data(id, format, comments, fields) {
-                    Ok(bytes) => match crate::editing::write_atomically(&path.to_string_lossy(), &bytes) {
-                        Ok(()) => app.notify_fmt("Exported to {path}", &[("path", &path.display().to_string())]),
-                        Err(e) => app.notify_fmt("Couldn't write {name}: {e}", &[("name", &path.display().to_string()), ("e", &e.to_string())]),
-                    },
-                    Err(e) => app.notify_error(e),
-                }
-            };
             match self.save_override.clone() {
-                Some(p) => write(self, p.into()),
+                Some(p) => {
+                    let path = std::path::PathBuf::from(p);
+                    match export_format_for_path(&path) {
+                        Ok(format) => write_export_data(self, id, comments, fields, format, path),
+                        Err(error) => self.notify_error(error),
+                    }
+                }
                 None => {
-                    let title = if comments { tl!("Export comments") } else { tl!("Export form data") };
-                    let d = rfd::AsyncFileDialog::new().set_title(title).set_file_name(format!("{stem}.xfdf"));
-                    let d = if comments {
-                        d.add_filter("XFDF", &["xfdf"]).add_filter("FDF", &["fdf"])
-                    } else if xfa {
-                        // An XFA form's data, as Acrobat exports it, first.
-                        d.set_file_name(format!("{stem}.xml"))
-                            .add_filter("XML", &["xml"])
-                            .add_filter("XDP", &["xdp"])
-                            .add_filter("XFDF", &["xfdf"])
-                            .add_filter("FDF", &["fdf"])
-                            .add_filter("CSV", &["csv"])
-                            .add_filter(tl!("Text").to_string(), &["txt"])
-                    } else {
-                        d.add_filter("XFDF", &["xfdf"])
-                            .add_filter("FDF", &["fdf"])
-                            .add_filter("XML", &["xml"])
-                            .add_filter("CSV", &["csv"])
-                            .add_filter(tl!("Text").to_string(), &["txt"])
+                    let prompt = ExportDataPrompt {
+                        id,
+                        comments,
+                        fields,
+                        xfa,
+                        stem,
+                        folder,
+                        format: if xfa && !comments { pdfcraft_engine::DataFormat::Xml } else { pdfcraft_engine::DataFormat::Xfdf },
                     };
-                    let d = crate::editing::in_document_folder(d, folder.as_deref());
-                    self.ask_one(crate::pickers::Ask::Save(d), None, write);
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.export_data_prompt = Some(prompt);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    open_export_data_picker(self, prompt);
                 }
             }
         }
@@ -1079,9 +1157,195 @@ impl PdfCraftApp {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+/// Commit current typing, export the selected data and write it atomically.
+fn write_export_data(app: &mut PdfCraftApp, id: DocId, comments: bool, fields: bool, format: pdfcraft_engine::DataFormat, path: std::path::PathBuf) {
+    // Include what was typed while the save panel was open (#166).
+    if !app.commit_typing_in(id) {
+        return;
+    }
+    match app.session.export_data(id, format, comments, fields) {
+        Ok(bytes) => match crate::editing::write_atomically(&path.to_string_lossy(), &bytes) {
+            Ok(()) => app.notify_fmt("Exported to {path}", &[("path", &path.display().to_string())]),
+            Err(e) => app.notify_fmt("Couldn't write {name}: {e}", &[("name", &path.display().to_string()), ("e", &e.to_string())]),
+        },
+        Err(e) => app.notify_error(e),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Open the native save panel with the applicable format filters and default suffix.
+fn open_export_data_picker(app: &mut PdfCraftApp, prompt: ExportDataPrompt) {
+    let title = if prompt.comments { tl!("Export comments") } else { tl!("Export form data") };
+    let ext = export_format_extension(prompt.format);
+    let default_name = format!("{}.{}", prompt.stem, ext);
+    let mut dialog = rfd::AsyncFileDialog::new().set_title(title).set_file_name(&default_name);
+    #[cfg(target_os = "macos")]
+    {
+        // macOS hides filter names; this single allowed type also guides its Save panel toward
+        // the selected format before the user confirms the destination.
+        dialog = dialog.add_filter(export_format_label(prompt.format), &[ext]);
+    }
+    #[cfg(not(target_os = "macos"))]
+    for format in export_formats(prompt.comments, prompt.xfa) {
+        let extension = export_format_extension(*format);
+        let label = if *format == pdfcraft_engine::DataFormat::Txt { tl!("Text").to_string() } else { export_format_label(*format).to_string() };
+        dialog = dialog.add_filter(label, &[extension]);
+    }
+    let dialog = crate::editing::in_document_folder(dialog, prompt.folder.as_deref());
+    app.ask_one(crate::pickers::Ask::Save(dialog), None, move |app, path| {
+        #[cfg(target_os = "macos")]
+        match resolve_export_path(path, Some(prompt.format)) {
+            ExportPathResolution::Export { format, path } => write_export_data(app, prompt.id, prompt.comments, prompt.fields, format, path),
+            ExportPathResolution::Retry { error, path } => {
+                app.notify_error(error);
+                // Do not redirect an already-confirmed destination to a different path. Let the
+                // user confirm again with the selected format and its suggested extension.
+                prompt.folder = path.parent().filter(|parent| !parent.as_os_str().is_empty()).map(|parent| parent.to_string_lossy().into_owned());
+                if let Some(stem) = path.file_stem() {
+                    prompt.stem = stem.to_string_lossy().into_owned();
+                }
+                open_export_data_picker(app, prompt);
+            }
+            ExportPathResolution::Reject(error) => app.notify_error(error),
+        }
+        #[cfg(not(target_os = "macos"))]
+        match resolve_export_path(path, None) {
+            ExportPathResolution::Export { format, path } => write_export_data(app, prompt.id, prompt.comments, prompt.fields, format, path),
+            ExportPathResolution::Retry { error, .. } | ExportPathResolution::Reject(error) => app.notify_error(error),
+        }
+    });
+}
+
+/// Draw the macOS format choice and open the native save panel only after confirmation.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn export_data_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
+    let Some(mut prompt) = app.export_data_prompt.clone() else { return };
+    let mut chosen = false;
+    let mut canceled = false;
+    let title = if prompt.comments { tl!("Export comments") } else { tl!("Export form data") };
+    let modal = crate::widgets::show_modal(ctx, "export_data_format", |ui| {
+        ui.heading(title);
+        ui.add_space(6.0);
+        egui::ComboBox::from_id_salt("export_data_format_choice").selected_text(export_format_label(prompt.format)).show_ui(ui, |ui| {
+            for format in export_formats(prompt.comments, prompt.xfa) {
+                ui.selectable_value(&mut prompt.format, *format, export_format_label(*format));
+            }
+        });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.button(tl!("Cancel")).clicked() {
+                canceled = true;
+            }
+            if ui.button(tl!("Export")).clicked() {
+                chosen = true;
+            }
+        });
+    });
+    if chosen {
+        app.export_data_prompt = None;
+        open_export_data_picker(app, prompt);
+    } else if canceled || modal.should_close() {
+        app.export_data_prompt = None;
+    } else {
+        app.export_data_prompt = Some(prompt);
+    }
+}
+
 #[cfg(test)]
 mod stem_tests {
-    use super::{attachment_file_name, file_stem_from_user, is_plain_file_name};
+    use super::{
+        DocId, ExportPathResolution, attachment_file_name, export_format_extension, export_format_for_path, export_formats, file_stem_from_user,
+        is_plain_file_name, resolve_export_path,
+    };
+    use pdfcraft_engine::DataFormat as F;
+
+    #[test]
+    fn export_choices_match_form_type_and_comment_scope() {
+        assert_eq!(export_formats(false, false), &[F::Xfdf, F::Fdf, F::Xml, F::Csv, F::Txt]);
+        assert_eq!(export_formats(false, true), &[F::Xml, F::Xdp, F::Xfdf, F::Fdf, F::Csv, F::Txt]);
+        assert_eq!(export_formats(true, false), &[F::Xfdf, F::Fdf]);
+        assert_eq!(export_formats(true, true), &[F::Xfdf, F::Fdf]);
+    }
+
+    #[test]
+    fn selected_export_format_controls_the_filename_extension() {
+        for format in [F::Xfdf, F::Fdf, F::Xml, F::Xdp, F::Csv, F::Txt] {
+            let extension = export_format_extension(format);
+            assert_eq!(F::from_extension(extension), Some(format));
+            assert_eq!(export_format_for_path(std::path::Path::new(&format!("report.{extension}"))), Ok(format));
+        }
+    }
+
+    #[test]
+    fn selected_format_retries_mismatched_confirmed_paths_without_redirecting() {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-export-path-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let confirmed_path = dir.join("report.xml");
+        let rewritten_path = dir.join("report.csv");
+        std::fs::write(&confirmed_path, b"existing XML destination").unwrap();
+        match resolve_export_path(confirmed_path.clone(), Some(F::Csv)) {
+            ExportPathResolution::Retry { error, path } => {
+                assert!(error.contains(".csv"));
+                assert_eq!(path, confirmed_path);
+            }
+            _ => panic!("a mismatched suffix must require a new confirmation"),
+        }
+        assert_eq!(std::fs::read(&confirmed_path).unwrap(), b"existing XML destination");
+        assert!(!rewritten_path.exists(), "the confirmed XML path must not be redirected to CSV");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn extensionless_and_unknown_paths_are_explicit_errors() {
+        for path in ["report", "report.unknown"] {
+            let error = export_format_for_path(std::path::Path::new(path)).unwrap_err();
+            assert!(error.contains("no file was written"), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn native_picker_resolution_preserves_the_confirmed_matching_path() {
+        let path = std::path::PathBuf::from("folder/report.CSV");
+        match resolve_export_path(path.clone(), Some(F::Csv)) {
+            ExportPathResolution::Export { format, path: resolved } => {
+                assert_eq!(format, F::Csv);
+                assert_eq!(resolved, path);
+            }
+            _ => panic!("a matching suffix should dispatch the selected format"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn escape_cancels_export_format_prompt_without_opening_a_save_picker() {
+        let mut app = crate::PdfCraftApp::new();
+        app.export_data_prompt = Some(super::ExportDataPrompt {
+            id: DocId(1),
+            comments: false,
+            fields: true,
+            xfa: false,
+            stem: "form".into(),
+            folder: None,
+            format: F::Xfdf,
+        });
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| super::export_data_prompt(&mut app, ctx));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| super::export_data_prompt(&mut app, ctx),
+        );
+        assert!(app.export_data_prompt.is_none());
+    }
 
     #[test]
     fn user_file_names_stay_inside_the_folder_and_writable_everywhere() {
